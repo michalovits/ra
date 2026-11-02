@@ -44,6 +44,7 @@
 %% API
 -export([start_link/1,
          command/3,
+         command/4,
          cast_command/2,
          cast_command/3,
          query/5,
@@ -69,6 +70,7 @@
 -define(DEFAULT_AWAIT_CONDITION_TIMEOUT, 30000).
 %% Utilisation average calculations are all in μs.
 -define(INSTALL_SNAP_RPC_TIMEOUT, 120 * 1000).
+-define(CLUSTER_UID_ENVELOPE, '$ra_cluster_uid').
 
 -define(HANDLE_EFFECTS(Effects, EvtType, State0),
         handle_effects(?FUNCTION_NAME, Effects, EvtType, State0)).
@@ -138,6 +140,7 @@
 -record(conf, {log_id :: unicode:chardata(),
                name :: atom(),
                cluster_name :: term(),
+               cluster_uid :: undefined | ra_cluster_uid(),
                broadcast_time = ?DEFAULT_BROADCAST_TIME :: non_neg_integer(),
                tick_timeout :: non_neg_integer(),
                await_condition_timeout :: non_neg_integer(),
@@ -181,6 +184,17 @@ start_link(Config = #{id := Id}) ->
     ra_cmd_ret().
 command(ServerLoc, Cmd, Timeout) ->
     leader_call(ServerLoc, {command, normal, Cmd}, Timeout).
+
+-spec command(server_loc(), ra_command(), timeout(),
+              undefined | ra_cluster_uid()) ->
+    ra_cmd_ret().
+command(ServerLoc, Cmd, Timeout, undefined) ->
+    command(ServerLoc, Cmd, Timeout);
+command(ServerLoc, Cmd, Timeout, ClusterUId) ->
+    statem_call(ServerLoc,
+                {?CLUSTER_UID_ENVELOPE, ClusterUId,
+                 {leader_call, {command, normal, Cmd}}},
+                Timeout).
 
 -spec cast_command(ra_server_id(), ra_command()) -> ok.
 cast_command(ServerId, Cmd) ->
@@ -306,7 +320,8 @@ multi_statem_call([ServerId | ServerIds], Msg, Errs, Timeout) ->
                 (Info == noproc orelse
                  Info == nodedown orelse
                  Info == shutdown orelse
-                 Info == system_not_started)) ->
+                 Info == system_not_started orelse
+                 Info == cluster_uid_mismatch)) ->
             %% these are the retryable errors, any others we consider
             %% genuine errors that a retry will not fix
             case ServerIds of
@@ -396,6 +411,8 @@ do_init(#{id := Id,
     #{commit_index := CommitIndex} = ServerState,
     State = #state{conf = #conf{log_id = LogId,
                                 cluster_name = ClusterName,
+                                cluster_uid = maps:get(cluster_uid, Config,
+                                                       undefined),
                                 name = Key,
                                 tick_timeout = TickTime,
                                 await_condition_timeout = AwaitCondTimeout,
@@ -640,7 +657,15 @@ leader({call, From}, trigger_election, State) ->
     {keep_state, State, [{reply, From, ok}]};
 leader({call, From}, {read_entries, Indexes}, State) ->
     read_entries0(From, Indexes, State);
-leader(EventType, Msg, State0) ->
+leader(EventType, Msg0, State) ->
+    case check_cluster_uid(EventType, Msg0, State) of
+        {ok, Msg} ->
+            leader(EventType, Msg, State, same_cluster);
+        Handled ->
+            Handled
+    end.
+
+leader(EventType, Msg, State0, same_cluster) ->
     case handle_leader(Msg, State0) of
         {leader, State1, Effects1} ->
             {State, Actions} = ?HANDLE_EFFECTS(Effects1, EventType, State1),
@@ -718,7 +743,15 @@ candidate({call, From}, trigger_election, State) ->
     {keep_state, State, [{reply, From, ok}]};
 candidate({call, From}, {read_entries, Indexes}, State) ->
     read_entries0(From, Indexes, State);
-candidate(EventType, Msg, State0) ->
+candidate(EventType, Msg0, State) ->
+    case check_cluster_uid(EventType, Msg0, State) of
+        {ok, Msg} ->
+            candidate(EventType, Msg, State, same_cluster);
+        Handled ->
+            Handled
+    end.
+
+candidate(EventType, Msg, State0, same_cluster) ->
     case handle_candidate(Msg, State0) of
         {candidate, State1, Effects} ->
             {State2, Actions0} = ?HANDLE_EFFECTS(Effects, EventType, State1),
@@ -784,7 +817,15 @@ pre_vote({call, From}, trigger_election, State) ->
     {keep_state, State, [{reply, From, ok}]};
 pre_vote({call, From}, {read_entries, Indexes}, State) ->
     read_entries0(From, Indexes, State);
-pre_vote(EventType, Msg, State0) ->
+pre_vote(EventType, Msg0, State) ->
+    case check_cluster_uid(EventType, Msg0, State) of
+        {ok, Msg} ->
+            pre_vote(EventType, Msg, State, same_cluster);
+        Handled ->
+            Handled
+    end.
+
+pre_vote(EventType, Msg, State0, same_cluster) ->
     case handle_pre_vote(Msg, State0) of
         {pre_vote, State1, Effects} ->
             {State2, Actions0} = ?HANDLE_EFFECTS(Effects, EventType, State1),
@@ -931,8 +972,16 @@ follower(_, tick_timeout,
     {keep_state, State, set_tick_timer(State, Actions)};
 follower({call, From}, {read_entries, Indexes}, State) ->
     read_entries0(From, Indexes, State);
+follower(EventType, Msg0, State) ->
+    case check_cluster_uid(EventType, Msg0, State) of
+        {ok, Msg} ->
+            follower(EventType, Msg, State, same_cluster);
+        Handled ->
+            Handled
+    end.
+
 follower(EventType, Msg, #state{conf = #conf{name = Name},
-                                server_state = SS0} = State0) ->
+                                server_state = SS0} = State0, same_cluster) ->
     case handle_follower(Msg, State0) of
         {follower, State1, Effects} ->
             {State2, Actions} = ?HANDLE_EFFECTS(Effects, EventType, State1),
@@ -1022,7 +1071,15 @@ receive_snapshot(cast, {command, _Priority,
     {keep_state, State, []};
 receive_snapshot({call, From}, ping, State) ->
     {keep_state, State, [{reply, From, {pong, receive_snapshot}}]};
-receive_snapshot(EventType, Msg, State00) ->
+receive_snapshot(EventType, Msg0, State) ->
+    case check_cluster_uid(EventType, Msg0, State) of
+        {ok, Msg} ->
+            receive_snapshot(EventType, Msg, State, same_cluster);
+        Handled ->
+            Handled
+    end.
+
+receive_snapshot(EventType, Msg, State00, same_cluster) ->
     %% HACK: if the EventType is a {call, From} we stash the from in the
     %% ServerState, this is so ra_server can defer the snapshot reply in
     %% some cases
@@ -1196,7 +1253,15 @@ await_condition({timeout, {snapshot_retry, _}}, {snapshot_retry, _}, _State) ->
     {keep_state_and_data, [postpone]};
 await_condition({call, From}, {read_entries, Indexes}, State) ->
     read_entries0(From, Indexes, State);
-await_condition(EventType, Msg, State0) ->
+await_condition(EventType, Msg0, State) ->
+    case check_cluster_uid(EventType, Msg0, State) of
+        {ok, Msg} ->
+            await_condition(EventType, Msg, State, same_cluster);
+        Handled ->
+            Handled
+    end.
+
+await_condition(EventType, Msg, State0, same_cluster) ->
     case handle_await_condition(Msg, State0) of
         {follower, State1, Effects} ->
             {State2, Actions} = ?HANDLE_EFFECTS(Effects, EventType, State1),
@@ -1222,6 +1287,56 @@ is_command(Msg) when is_tuple(Msg) ->
     element(1, Msg) == command;
 is_command(_) ->
     false.
+
+check_cluster_uid(EventType, {?CLUSTER_UID_ENVELOPE, MsgClusterUId, Msg},
+                  State) ->
+    check_cluster_uid(EventType, MsgClusterUId, Msg, State);
+check_cluster_uid(EventType, Msg, State) ->
+    case is_peer_message(Msg) of
+        true ->
+            check_cluster_uid(EventType, undefined, Msg, State);
+        false ->
+            {ok, Msg}
+    end.
+
+check_cluster_uid(EventType, ClusterUId, Msg,
+                  #state{conf = #conf{cluster_uid = ClusterUId}} = State) ->
+    case is_peer_message(Msg) of
+        true ->
+            {ok, Msg};
+        false ->
+            {keep_state, State, [{next_event, EventType, Msg}]}
+    end;
+check_cluster_uid(EventType, MsgClusterUId, _Msg, State) ->
+    ?DEBUG("~ts: rejected message with cluster UID ~tp",
+           [log_id(State), MsgClusterUId]),
+    case EventType of
+        {call, From} ->
+            {keep_state, State, [{reply, From, {error, cluster_uid_mismatch}}]};
+        _ ->
+            {keep_state, State, []}
+    end.
+
+wrap_peer_message(undefined, Msg) ->
+    Msg;
+wrap_peer_message(ClusterUId, Msg) ->
+    case is_peer_message(Msg) of
+        true ->
+            {?CLUSTER_UID_ENVELOPE, ClusterUId, Msg};
+        false ->
+            Msg
+    end.
+
+is_peer_message(#append_entries_rpc{}) -> true;
+is_peer_message(#heartbeat_rpc{}) -> true;
+is_peer_message(#info_rpc{}) -> true;
+is_peer_message(#info_reply{}) -> true;
+is_peer_message(#request_vote_rpc{}) -> true;
+is_peer_message(#pre_vote_rpc{}) -> true;
+is_peer_message(#install_snapshot_rpc{}) -> true;
+is_peer_message({_PeerId, #append_entries_reply{}}) -> true;
+is_peer_message({_PeerId, #heartbeat_reply{}}) -> true;
+is_peer_message(_) -> false.
 
 
 handle_event(_EventType, EventContent, StateName, State) ->
@@ -1560,7 +1675,9 @@ handle_effect(_RaftState, {send_rpc, To, Rpc}, _,
                                  %% AFAIK none of the below code will throw and
                                  %% exception so we should always end up setting
                                  %% the peer status back to normal
-                                 ok = gen_statem:cast(To, Rpc),
+                                 ok = gen_statem:cast(
+                                        To, wrap_peer_message(
+                                              Conf#conf.cluster_uid, Rpc)),
                                  incr_counter(Conf, ?C_RA_SRV_MSGS_SENT, 1),
                                  Self ! {unsuspend_peer, To}
                          end),
@@ -1573,10 +1690,13 @@ handle_effect(_RaftState, {send_rpc, To, Rpc}, _,
             %% for noconnects just allow it to pipeline and catch up later
             {State0, Actions}
     end;
-handle_effect(_, {next_event, Evt}, EvtType, State, Actions) ->
-    {State, [{next_event, EvtType, Evt} |  Actions]};
-handle_effect(_, {next_event, _, _} = Next, _, State, Actions) ->
-    {State, [Next | Actions]};
+handle_effect(RaftState, {next_event, Evt}, EvtType, State, Actions) ->
+    handle_effect(RaftState, {next_event, EvtType, Evt}, EvtType, State,
+                  Actions);
+handle_effect(_, {next_event, Type, Evt}, _,
+              #state{conf = #conf{cluster_uid = ClusterUId}} = State,
+              Actions) ->
+    {State, [{next_event, Type, wrap_peer_message(ClusterUId, Evt)} | Actions]};
 handle_effect(leader, {send_msg, To, Msg}, _, State, Actions) ->
     %% default is to send without any wrapping
     ToNode = get_node(To),
@@ -1646,9 +1766,11 @@ handle_effect(leader, {notify, Nots}, _, #state{} = State0, Actions) ->
     %% should only be done by leader
     State = send_applied_notifications(Nots, State0),
     {State, Actions};
-handle_effect(_AnyState, {cast, To, Msg}, _, State, Actions) ->
+handle_effect(_AnyState, {cast, To, Msg}, _,
+              #state{conf = #conf{cluster_uid = ClusterUId}} = State,
+              Actions) ->
     %% TODO: handle send failure
-    _ = gen_cast(To, Msg, State),
+    _ = gen_cast(To, wrap_peer_message(ClusterUId, Msg), State),
     {State, Actions};
 handle_effect(RaftState, {reply, {Pid, _Tag} = From, Reply, Replier}, _,
               State, Actions) ->
@@ -1711,10 +1833,12 @@ handle_effect(leader, {send_snapshot, {_, ToNode} = To, {SnapState, _Id, Term}},
                            end,
             Id = ra_server:id(SS0),
             UId = ra_server:uid(SS0),
+            ClusterUId = Conf#conf.cluster_uid,
             Pid = spawn(fun () ->
                                 send_snapshots(Id, Term, To,
                                                ChunkSize, InstallSnapTimeout,
-                                               SnapState, Machine, LogId, UId)
+                                               SnapState, Machine, LogId, UId,
+                                               ClusterUId)
                         end),
             ok = incr_counter(Conf, ?C_RA_SRV_SNAPSHOTS_SENT, 1),
             %% update the peer state so that no pipelined entries are sent
@@ -1739,7 +1863,9 @@ handle_effect(_, {delete_snapshot, Dir, SnapshotRef}, _, State0, Actions) ->
               end),
     {State0, Actions};
 handle_effect(_, {send_vote_requests, VoteRequests}, _, % EvtType
-              #state{conf = #conf{aten_poll_interval = Poll}} = State, Actions) ->
+              #state{conf = #conf{aten_poll_interval = Poll,
+                                  cluster_uid = ClusterUId}} = State,
+              Actions) ->
     % transient election processes
     %% set the timeout to the aten poll interval which is the approximate maximum
     %% election timeout value
@@ -1747,7 +1873,10 @@ handle_effect(_, {send_vote_requests, VoteRequests}, _, % EvtType
     Me = self(),
     [begin
          _ = spawn(fun () ->
-                           Reply = gen_statem:call(ServerId, Request, Timeout),
+                           Reply = gen_statem:call(
+                                     ServerId,
+                                     wrap_peer_message(ClusterUId, Request),
+                                     Timeout),
                            ok = gen_statem:cast(Me, Reply)
                    end)
      end || {ServerId, Request} <- VoteRequests],
@@ -1874,7 +2003,8 @@ make_rpcs(State) ->
 send_rpc(To, Msg, State) ->
     incr_counter(State#state.conf, ?C_RA_SRV_RPCS_SENT, 1),
     % fake gen cast
-    gen_cast(To, Msg, State).
+    gen_cast(To, wrap_peer_message(State#state.conf#conf.cluster_uid, Msg),
+             State).
 
 gen_cast(To, Msg, State) ->
     send(To, {'$gen_cast', Msg}, State#state.conf).
@@ -2110,7 +2240,8 @@ read_entries0(From, Idxs, #state{server_state = #{log := Log}} = State) ->
     {keep_state, State, [{reply, From, {ok, ReadState}}]}.
 
 send_snapshots(Id, Term, {_, ToNode} = To, ChunkSize,
-               InstallTimeout, SnapState, Machine, LogId, UID = UId) ->
+               InstallTimeout, SnapState, Machine, LogId, UID = UId,
+               ClusterUId) ->
     Context = ra_snapshot:context(SnapState, ToNode),
     case ra_snapshot:begin_read(SnapState, Context) of
         {error, Reason} ->
@@ -2150,8 +2281,9 @@ send_snapshots(Id, Term, {_, ToNode} = To, ChunkSize,
                             ok;
                         {UID, SnapIdx, _SmallestIdx, LiveIndexes} ->
                             %% first send the init phase
-                            try gen_statem:call(To, RPC,
-                                                {dirty_timeout, InstallTimeout}) of
+                            try gen_statem:call(
+                                  To, wrap_peer_message(ClusterUId, RPC),
+                                  {dirty_timeout, InstallTimeout}) of
                                 #install_snapshot_result{} ->
                                     ok;
                                 #append_entries_reply{} = AER ->
@@ -2166,7 +2298,9 @@ send_snapshots(Id, Term, {_, ToNode} = To, ChunkSize,
                                            "index ~b, forwarding its "
                                            "append_entries_reply to the leader",
                                            [LogId, To, SnapIdx]),
-                                    ok = gen_statem:cast(Id, {To, AER}),
+                                    ok = gen_statem:cast(
+                                           Id, wrap_peer_message(ClusterUId,
+                                                                 {To, AER})),
                                     exit(normal);
                                 Unexp ->
                                     ?INFO("~ts: ~tw returned an unexpected"
@@ -2192,7 +2326,8 @@ send_snapshots(Id, Term, {_, ToNode} = To, ChunkSize,
                                    "range ~w to ~tw ",
                                    [LogId, ra_seq:length(Indexes),
                                     ra_seq:range(Indexes), To]),
-                            try send_pre_snapshot_entries(Id, To, RPC, Indexes,
+                            try send_pre_snapshot_entries(Id, To, ClusterUId,
+                                                          RPC, Indexes,
                                                           InstallTimeout,
                                                           undefined) of
                                 MaybeFlru ->
@@ -2214,16 +2349,17 @@ send_snapshots(Id, Term, {_, ToNode} = To, ChunkSize,
                             exit({snapshot_index_mismatch, TableSnapIdx, SnapIdx})
                     end,
 
-                    Result = send_snapshot_chunks(RPC, To, ReadState, 1,
-                                                  ChunkSize, InstallTimeout,
-                                                  SnapState),
+                    Result = send_snapshot_chunks(RPC, To, ClusterUId,
+                                                  ReadState, 1, ChunkSize,
+                                                  InstallTimeout, SnapState),
                     ?DEBUG("~ts: sending snapshot to ~tw completed",
                            [LogId, To]),
-                    ok = gen_statem:cast(Id, {To, Result})
+                    ok = gen_statem:cast(Id, wrap_peer_message(ClusterUId,
+                                                               {To, Result}))
             end
     end.
 
-send_snapshot_chunks(RPC0, To, ReadState0, Num, ChunkSize,
+send_snapshot_chunks(RPC0, To, ClusterUId, ReadState0, Num, ChunkSize,
                      InstallTimeout, SnapState) ->
     {ok, Data, ContState} = ra_snapshot:read_chunk(ReadState0, ChunkSize,
                                                    SnapState),
@@ -2235,11 +2371,11 @@ send_snapshot_chunks(RPC0, To, ReadState0, Num, ChunkSize,
     %% rpcs
     RPC1 = RPC0#install_snapshot_rpc{chunk_state = {Num, ChunkFlag},
                                      data = Data},
-    Res1 = gen_statem:call(To, RPC1,
+    Res1 = gen_statem:call(To, wrap_peer_message(ClusterUId, RPC1),
                            {dirty_timeout, InstallTimeout}),
     case ContState of
         {next, ReadState1} ->
-            send_snapshot_chunks(RPC0, To, ReadState1, Num + 1,
+            send_snapshot_chunks(RPC0, To, ClusterUId, ReadState1, Num + 1,
                                  ChunkSize, InstallTimeout, SnapState);
         last ->
             Res1
@@ -2249,7 +2385,8 @@ send_snapshot_chunks(RPC0, To, ReadState0, Num, ChunkSize,
 %% This overlaps reading the next chunk with sending the current chunk
 %% to reduce blocking time. Uses lazy chunking to avoid expanding
 %% the entire sequence upfront.
-send_pre_snapshot_entries(Id, To, RPC, Indexes, InstallTimeout, Flru0) ->
+send_pre_snapshot_entries(Id, To, ClusterUId, RPC, Indexes, InstallTimeout,
+                          Flru0) ->
     case ra_seq:list_chunk(16, Indexes) of
         end_of_seq ->
             Flru0;
@@ -2258,18 +2395,19 @@ send_pre_snapshot_entries(Id, To, RPC, Indexes, InstallTimeout, Flru0) ->
             {ok, {Ents0, Flru1}} = ra_server_proc:read_entries(Id, FirstIs, Flru0,
                                                                infinity),
             Ents = [map_get(I, Ents0) || I <- FirstIs],
-            send_pre_snapshot_entries0(Id, To, RPC, SeqIter, Ents,
+            send_pre_snapshot_entries0(Id, To, ClusterUId, RPC, SeqIter, Ents,
                                        InstallTimeout, Flru1)
     end.
 
-send_pre_snapshot_entries0(Id, To, RPC, SeqIter, CurrentEnts,
+send_pre_snapshot_entries0(Id, To, ClusterUId, RPC, SeqIter, CurrentEnts,
                            InstallTimeout, Flru0) ->
     case ra_seq:list_chunk(16, SeqIter) of
         end_of_seq ->
             %% Last chunk: just send it, no more reads to start
             RPC1 = RPC#install_snapshot_rpc{chunk_state = {0, pre},
                                             data = CurrentEnts},
-            Res = gen_statem:call(To, RPC1, {dirty_timeout, InstallTimeout}),
+            Res = gen_statem:call(To, wrap_peer_message(ClusterUId, RPC1),
+                                  {dirty_timeout, InstallTimeout}),
             ?assert(is_record(Res, install_snapshot_result)),
             Flru0;
         {NextIs, NextSeqIter} ->
@@ -2279,7 +2417,8 @@ send_pre_snapshot_entries0(Id, To, RPC, SeqIter, CurrentEnts,
             %% Send current entries to remote server (blocking)
             RPC1 = RPC#install_snapshot_rpc{chunk_state = {0, pre},
                                             data = CurrentEnts},
-            Res = gen_statem:call(To, RPC1, {dirty_timeout, InstallTimeout}),
+            Res = gen_statem:call(To, wrap_peer_message(ClusterUId, RPC1),
+                                  {dirty_timeout, InstallTimeout}),
             ?assert(is_record(Res, install_snapshot_result)),
             %% Wait for the async read plan response
             {ok, ReadPlan} = case gen_statem:receive_response(ReqId, infinity) of
@@ -2299,8 +2438,8 @@ send_pre_snapshot_entries0(Id, To, RPC, SeqIter, CurrentEnts,
                                                         file_advise => random,
                                                         index_mode => binary}),
             NextEnts = [map_get(I, Reads) || I <- NextIs],
-            send_pre_snapshot_entries0(Id, To, RPC, NextSeqIter, NextEnts,
-                                       InstallTimeout, Flru1)
+            send_pre_snapshot_entries0(Id, To, ClusterUId, RPC, NextSeqIter,
+                                       NextEnts, InstallTimeout, Flru1)
     end.
 
 maybe_evict_flru(undefined) ->

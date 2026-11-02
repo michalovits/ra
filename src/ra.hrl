@@ -31,6 +31,8 @@
 %% used for on disk resources and local name to pid mapping
 -type ra_uid() :: binary().
 
+-type ra_cluster_uid() :: ra_uid().
+
 %% Identifies a Ra server (node) in a Ra cluster.
 %%
 %% Ra servers need to be registered stable names (names that are reachable

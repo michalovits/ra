@@ -238,6 +238,7 @@
                               %% server - will default to the id formatted
                               %% with `~tw'
                               cluster_name := ra_cluster_name(),
+                              cluster_uid => undefined | ra_cluster_uid(),
                               log_init_args := ra_log:ra_log_init_args(),
                               initial_members := [ra_server_id()],
                               machine := machine_conf(),

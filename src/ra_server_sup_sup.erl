@@ -27,6 +27,7 @@
          stop_server/2,
          stop_server/3,
          delete_server/3,
+         delete_server/4,
          remove_all/1,
          start_link/1,
          recover_config/2,
@@ -34,6 +35,7 @@
          start_server_rpc/3,
          restart_server_rpc/3,
          delete_server_rpc/2,
+         cluster_uid_rpc/2,
          prepare_server_stop_rpc/2]).
 
 %% Supervisor callbacks
@@ -172,6 +174,36 @@ delete_server(System, ServerId, Timeout) when is_atom(System) ->
         ok ->
             rpc:call(Node, ?MODULE, delete_server_rpc, [System, Name], Timeout);
         {error, _} = Err -> Err
+    end.
+
+-spec delete_server(atom(), ServerId :: ra_server_id(), Timeout :: timeout(),
+                    ra_cluster_uid()) ->
+    ok | {error, term()} | {badrpc, term()}.
+delete_server(System, ServerId, Timeout, ClusterUId) when is_atom(System) ->
+    Node = ra_lib:ra_server_id_node(ServerId),
+    Name = ra_lib:ra_server_id_to_local_name(ServerId),
+    case rpc:call(Node, ?MODULE, cluster_uid_rpc, [System, Name], Timeout) of
+        {ok, ClusterUId} ->
+            delete_server(System, ServerId, Timeout);
+        {ok, _} ->
+            {error, cluster_uid_mismatch};
+        {error, name_not_registered} ->
+            ok;
+        Err ->
+            Err
+    end.
+
+cluster_uid_rpc(System, RaName) ->
+    case ra_directory:uid_of(System, RaName) of
+        undefined ->
+            {error, name_not_registered};
+        UId ->
+            case ra_log:read_config(ra_env:server_data_dir(System, UId)) of
+                {ok, Config} ->
+                    {ok, maps:get(cluster_uid, Config, undefined)};
+                Err ->
+                    Err
+            end
     end.
 
 delete_server_rpc(System, RaName) ->

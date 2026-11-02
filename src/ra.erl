@@ -43,6 +43,7 @@
          start_or_restart_cluster/5,
          delete_cluster/1,
          delete_cluster/2,
+         delete_cluster/3,
          % server management
          start_server/2,
          start_server/5,
@@ -51,6 +52,7 @@
          stop_server/2,
          force_delete_server/2,
          force_delete_server/3,
+         force_delete_server/4,
          trigger_election/1,
          trigger_election/2,
          %% membership changes
@@ -272,6 +274,15 @@ force_delete_server(System, ServerId) ->
     ok | {error, term()} | {badrpc, term()}.
 force_delete_server(System, ServerId, Timeout) ->
     ra_server_sup_sup:delete_server(System, ServerId, Timeout).
+
+-spec force_delete_server(atom(), ServerId :: ra_server_id(),
+                          Timeout :: timeout(),
+                          undefined | ra_cluster_uid()) ->
+    ok | {error, cluster_uid_mismatch | term()} | {badrpc, term()}.
+force_delete_server(System, ServerId, Timeout, undefined) ->
+    force_delete_server(System, ServerId, Timeout);
+force_delete_server(System, ServerId, Timeout, ClusterUId) ->
+    ra_server_sup_sup:delete_server(System, ServerId, Timeout, ClusterUId).
 
 %% @doc Starts or restarts a ra cluster.
 %%
@@ -556,8 +567,14 @@ delete_cluster(ServerIds) ->
 -spec delete_cluster(ServerIds :: [ra_server_id()], timeout()) ->
     {ok, Leader :: ra_server_id()} | {error, term()}.
 delete_cluster(ServerIds, Timeout) ->
+    delete_cluster(ServerIds, Timeout, undefined).
+
+-spec delete_cluster(ServerIds :: [ra_server_id()], timeout(),
+                     undefined | ra_cluster_uid()) ->
+    {ok, Leader :: ra_server_id()} | {error, term()}.
+delete_cluster(ServerIds, Timeout, ClusterUId) ->
     DeleteCmd = {'$ra_cluster', delete, await_consensus},
-    case ra_server_proc:command(ServerIds, DeleteCmd, Timeout) of
+    case ra_server_proc:command(ServerIds, DeleteCmd, Timeout, ClusterUId) of
         {ok, _, Leader} ->
             {ok, Leader};
         {timeout, _} ->
